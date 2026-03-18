@@ -6,7 +6,7 @@
 # network storage every 50 steps. Auto-resumes if restarted.
 #
 # Usage:
-#   git clone https://github.com/YOUR_USER/BAM.git
+#   git clone https://github.com/sunnytroo01/BAM.git
 #   cd BAM
 #   bash train.sh
 #

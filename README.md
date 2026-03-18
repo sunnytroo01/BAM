@@ -34,7 +34,7 @@ At inference, the memory matrix M is fixed-size (`H × d_head²`) regardless of 
 Spin up any cheap GPU pod with a **network volume** attached. Then:
 
 ```bash
-git clone https://github.com/YOUR_USER/BAM.git
+git clone https://github.com/sunnytroo01/BAM.git
 cd BAM
 bash setup_data.sh
 ```
@@ -46,7 +46,7 @@ This downloads training data to your network volume at `/workspace/data/btn`. Te
 Spin up your B200 pod(s) with the **same network volume**. Then:
 
 ```bash
-git clone https://github.com/YOUR_USER/BAM.git
+git clone https://github.com/sunnytroo01/BAM.git
 cd BAM
 bash train.sh
 ```

@@ -6,7 +6,7 @@
 # Once done, terminate this pod and start the B200 training pod.
 #
 # Usage:
-#   git clone https://github.com/YOUR_USER/BAM.git
+#   git clone https://github.com/sunnytroo01/BAM.git
 #   cd BAM
 #   bash setup_data.sh
 #
