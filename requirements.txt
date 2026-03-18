@@ -1,0 +1,9 @@
+# BTN - Binary Thinking Net
+# Core training dependencies
+torch>=2.1.0
+deepspeed>=0.12.0
+numpy>=1.24.0
+
+# Data download (only needed for setup_data.sh)
+datasets>=2.14.0
+huggingface_hub>=0.17.0
