@@ -1,15 +1,16 @@
 """
-Byte-level binary data pipeline for BTN.
+Byte-level binary data pipeline — optimized.
 
-Reads raw text files, converts to byte streams, and chunks into
-fixed-length sequences for next-byte prediction training.
-
-No tokenizer. No vocabulary. Just bytes.
+Optimizations:
+  - Returns uint8 tensors (8x smaller H2D transfer, cast to long on GPU)
+  - persistent_workers=True (no worker respawn between epochs)
+  - prefetch_factor=4 (deeper prefetch queue)
+  - Loads dataset into RAM by default (eliminates network storage page faults)
+  - num_workers scales with CPU count
 """
 
 import os
 import glob
-import mmap
 from pathlib import Path
 from typing import Optional
 
@@ -20,15 +21,8 @@ from torch.utils.data import Dataset, DataLoader, DistributedSampler
 
 class ByteDataset(Dataset):
     """
-    Memory-mapped byte-level dataset.
-
-    Reads text files, concatenates into a single byte stream stored as a
-    numpy memmap file (for efficient random access without loading into RAM),
-    and serves fixed-length chunks for autoregressive training.
-
-    Each sample is (context_length + 1) bytes:
-      - input:  bytes[0 : context_length]
-      - target: bytes[1 : context_length + 1]
+    Byte-level dataset. Returns uint8 tensors — cast to long on GPU in training loop.
+    Loads into RAM by default to eliminate network storage page fault latency.
     """
 
     def __init__(
@@ -37,16 +31,16 @@ class ByteDataset(Dataset):
         context_length: int,
         split: str = "train",
         val_fraction: float = 0.01,
+        load_into_ram: bool = True,
     ):
         self.context_length = context_length
-        self.seq_len = context_length + 1  # +1 for the target offset
+        self.seq_len = context_length + 1
 
         cache_dir = Path(data_dir) / ".cache"
         cache_dir.mkdir(exist_ok=True)
         memmap_path = cache_dir / "bytes.bin"
         meta_path = cache_dir / "meta.txt"
 
-        # Build or load the byte stream
         if not memmap_path.exists():
             print(f"[ByteDataset] Building byte cache from {data_dir} ...")
             byte_stream = self._read_all_files(data_dir)
@@ -60,10 +54,15 @@ class ByteDataset(Dataset):
         else:
             with open(meta_path, "r") as f:
                 total = int(f.read().strip())
-            print(f"[ByteDataset] Loaded cache: {total:,} bytes")
 
-        # Memory-map the byte file (read-only)
-        self.data = np.memmap(str(memmap_path), dtype=np.uint8, mode="r", shape=(total,))
+        # Load into RAM: eliminates random page fault latency on network storage
+        if load_into_ram:
+            print(f"[ByteDataset] Loading {total / 1e9:.2f} GB into RAM...")
+            self.data = np.fromfile(str(memmap_path), dtype=np.uint8)
+            print(f"[ByteDataset] Loaded into RAM")
+        else:
+            self.data = np.memmap(str(memmap_path), dtype=np.uint8, mode="r", shape=(total,))
+            print(f"[ByteDataset] Using memmap ({total / 1e9:.2f} GB)")
 
         # Train/val split
         n_val = max(int(total * val_fraction), self.seq_len * 10)
@@ -81,48 +80,32 @@ class ByteDataset(Dataset):
 
     def __getitem__(self, idx: int) -> torch.Tensor:
         offset = self.start + idx * self.seq_len
-        chunk = self.data[offset : offset + self.seq_len].astype(np.int64)
+        # Return uint8: 8x smaller than int64 for H2D transfer
+        chunk = np.array(self.data[offset : offset + self.seq_len])
         return torch.from_numpy(chunk)
 
     @staticmethod
     def _read_all_files(data_dir: str) -> np.ndarray:
-        """Read all text files in directory and concatenate as bytes."""
         patterns = ["*.txt", "*.md", "*.json", "*.jsonl", "*.csv", "*.html", "*.xml"]
         files = []
         for pattern in patterns:
             files.extend(glob.glob(os.path.join(data_dir, "**", pattern), recursive=True))
-
         if not files:
-            raise FileNotFoundError(
-                f"No text files found in {data_dir}. "
-                f"Supported extensions: {patterns}"
-            )
-
-        files.sort()  # deterministic order
+            raise FileNotFoundError(f"No text files found in {data_dir}")
+        files.sort()
         print(f"[ByteDataset] Found {len(files)} files")
-
         chunks = []
-        total_bytes = 0
         for f in files:
             try:
                 with open(f, "rb") as fp:
-                    raw = fp.read()
-                chunks.append(np.frombuffer(raw, dtype=np.uint8))
-                total_bytes += len(raw)
+                    chunks.append(np.frombuffer(fp.read(), dtype=np.uint8))
             except Exception as e:
                 print(f"[ByteDataset] Warning: skipping {f}: {e}")
-
         return np.concatenate(chunks)
 
 
 class SyntheticByteDataset(Dataset):
-    """
-    Synthetic random byte dataset for preflight validation and benchmarking.
-    No disk I/O required.
-    """
-
     def __init__(self, context_length: int, n_samples: int = 10_000):
-        self.context_length = context_length
         self.seq_len = context_length + 1
         self.n_samples = n_samples
 
@@ -130,7 +113,7 @@ class SyntheticByteDataset(Dataset):
         return self.n_samples
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        return torch.randint(0, 256, (self.seq_len,), dtype=torch.long)
+        return torch.randint(0, 256, (self.seq_len,), dtype=torch.uint8)
 
 
 def create_dataloader(
@@ -141,17 +124,6 @@ def create_dataloader(
     rank: int = 0,
     synthetic: bool = False,
 ) -> DataLoader:
-    """
-    Create a DataLoader for BTN training.
-
-    Args:
-        data_dir: path to directory of text files (ignored if synthetic=True)
-        config: BTNConfig
-        split: "train" or "val"
-        world_size: total number of GPUs
-        rank: this GPU's rank
-        synthetic: use random data (for preflight checks)
-    """
     if synthetic:
         dataset = SyntheticByteDataset(config.context_length, n_samples=1000)
     else:
@@ -164,20 +136,19 @@ def create_dataloader(
     sampler = None
     shuffle = split == "train"
     if world_size > 1:
-        sampler = DistributedSampler(
-            dataset,
-            num_replicas=world_size,
-            rank=rank,
-            shuffle=shuffle,
-        )
-        shuffle = False  # sampler handles shuffling
+        sampler = DistributedSampler(dataset, num_replicas=world_size, rank=rank, shuffle=shuffle)
+        shuffle = False
+
+    n_workers = min(8, max(1, (os.cpu_count() or 4) // max(world_size, 1)))
 
     return DataLoader(
         dataset,
         batch_size=config.micro_batch_size,
         shuffle=shuffle,
         sampler=sampler,
-        num_workers=4,
+        num_workers=n_workers,
         pin_memory=True,
         drop_last=True,
+        persistent_workers=n_workers > 0,
+        prefetch_factor=4 if n_workers > 0 else None,
     )

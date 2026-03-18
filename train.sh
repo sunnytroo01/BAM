@@ -2,9 +2,6 @@
 # =============================================================
 # BTN Training — Run on B200 pod(s) with network volume
 #
-# Reads data from network storage, saves checkpoints to
-# network storage every 50 steps. Auto-resumes if restarted.
-#
 # Usage:
 #   git clone https://github.com/sunnytroo01/BAM.git
 #   cd BAM
@@ -24,6 +21,18 @@ DATA_DIR="${DATA_DIR:-/workspace/data/btn}"
 OUTPUT_DIR="${OUTPUT_DIR:-/workspace/checkpoints/btn}"
 MICRO_BATCH="${MICRO_BATCH:-}"
 SAVE_EVERY="${SAVE_EVERY:-}"
+
+# ---- Performance env vars ----
+# CUDA memory allocator: reduce fragmentation, fewer OOMs
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
+# NCCL tuning for B200 NVLink/InfiniBand
+export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
+export NCCL_NET_GDR_LEVEL="${NCCL_NET_GDR_LEVEL:-5}"
+export NCCL_ASYNC_ERROR_HANDLING="${NCCL_ASYNC_ERROR_HANDLING:-1}"
+
+# Disable tokenizers parallelism (conflicts with dataloader workers)
+export TOKENIZERS_PARALLELISM=false
 
 # Auto-detect GPUs
 NUM_GPUS=$(nvidia-smi -L 2>/dev/null | wc -l || echo 1)
