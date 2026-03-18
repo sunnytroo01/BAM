@@ -183,6 +183,11 @@ def train(args):
     model = BinaryThinkingNet(config)
     log(f"  Parameters: {model.num_parameters():,} ({model.num_parameters() / 1e9:.2f}B)")
 
+    # torch.compile for fused kernels (significant speedup on modern GPUs)
+    if config.compile_model:
+        log("  Compiling model with torch.compile...")
+        model = torch.compile(model)
+
     # ---- DeepSpeed config ----
     ds_config_path = Path(__file__).parent / "ds_config.json"
     with open(ds_config_path) as f:
