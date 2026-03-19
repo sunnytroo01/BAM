@@ -40,13 +40,21 @@ _BPB_SCALE = 8.0 / math.log(2)
 # ---------------------------------------------------------------------------
 
 def get_lr(step: int, config: BTNConfig) -> float:
-    """Cosine decay with linear warmup."""
+    """WSD schedule: Warmup → Stable → Decay. Faster convergence than cosine.
+
+    - Warmup: linear ramp to peak LR
+    - Stable: hold at peak LR for 80% of training (allows early stopping)
+    - Decay: linear decay to min_lr over final 20%
+    """
     if step < config.warmup_steps:
         return config.learning_rate * step / max(config.warmup_steps, 1)
-    progress = (step - config.warmup_steps) / max(config.total_steps - config.warmup_steps, 1)
-    progress = min(progress, 1.0)
-    coeff = 0.5 * (1.0 + math.cos(math.pi * progress))
-    return config.min_lr + coeff * (config.learning_rate - config.min_lr)
+    stable_end = int(config.total_steps * 0.80)
+    if step < stable_end:
+        return config.learning_rate
+    # Linear decay over final 20%
+    decay_steps = config.total_steps - stable_end
+    progress = (step - stable_end) / max(decay_steps, 1)
+    return config.learning_rate - progress * (config.learning_rate - config.min_lr)
 
 
 def is_main_process() -> bool:
@@ -270,6 +278,18 @@ def train(args):
         # non_blocking: overlap H2D transfer with previous step's GPU tail
         # Data arrives as uint8 (8x smaller transfer), cast to long on GPU
         batch = batch.to(model_engine.device, non_blocking=True).long()
+
+        # Curriculum learning: truncate batch to current stage's context length
+        # Short sequences early → faster convergence in early training
+        if config.curriculum:
+            curr_ctx = config.context_length
+            for frac, ctx in config.curriculum:
+                if global_step < frac * config.total_steps:
+                    curr_ctx = ctx
+                    break
+            # +1 for target offset, + n_aux for multi-byte targets
+            max_offset = len(model.module.aux_heads) + 1 if hasattr(model, 'module') else len(model.aux_heads) + 1
+            batch = batch[:, :curr_ctx + max_offset]
 
         # ---- LR schedule ----
         lr = get_lr(global_step, config)
