@@ -61,22 +61,23 @@ def download_hf_dataset(
     print()
 
     # Stream dataset — never loads everything into RAM
-    ds = load_dataset(dataset_name, split=split, streaming=True)
+    # Some datasets (e.g., Wikipedia) need a config name
+    ds_config = DATASET_CONFIGS.get(dataset_name)
+    if ds_config:
+        print(f"Using config: {ds_config}")
+        ds = load_dataset(dataset_name, ds_config, split=split, streaming=True)
+    else:
+        ds = load_dataset(dataset_name, split=split, streaming=True)
 
     # Figure out the text column name
     text_col = None
+    sample = next(iter(ds))
     for col in ["text", "content", "document", "passage"]:
-        try:
-            sample = next(iter(ds))
-            if col in sample:
-                text_col = col
-                break
-        except Exception:
-            pass
+        if col in sample:
+            text_col = col
+            break
 
     if text_col is None:
-        # Try to detect from first sample
-        sample = next(iter(ds))
         for key, val in sample.items():
             if isinstance(val, str) and len(val) > 50:
                 text_col = key
@@ -210,6 +211,13 @@ DATASETS = {
     "pile": "EleutherAI/the_pile",
     "openwebtext": "Skylion007/openwebtext",
     "redpajama": "togethercomputer/RedPajama-Data-1T-Sample",
+    "wikipedia": "legacy-datasets/wikipedia",
+}
+
+# Special configs for datasets that need them
+DATASET_CONFIGS = {
+    "legacy-datasets/wikipedia": "20220301.en",
+    "wikimedia/wikipedia": "20231101.en",
 }
 
 

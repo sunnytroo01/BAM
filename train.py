@@ -218,6 +218,8 @@ def train(args):
         model_parameters=model.parameters(),
         config=ds_config,
     )
+    # CRITICAL: use engine's module for all forward/loss calls (ZeRO-3 shards params)
+    model = model_engine.module
 
     # ---- Data ----
     log("\nLoading data...")
@@ -288,7 +290,7 @@ def train(args):
                     curr_ctx = ctx
                     break
             # +1 for target offset, + n_aux for multi-byte targets
-            max_offset = len(model.module.aux_heads) + 1 if hasattr(model, 'module') else len(model.aux_heads) + 1
+            max_offset = len(model.aux_heads) + 1
             batch = batch[:, :curr_ctx + max_offset]
 
         # ---- LR schedule ----

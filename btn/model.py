@@ -58,7 +58,9 @@ class BinarizeSTE(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x):
         ctx.save_for_backward(x)
-        return torch.where(x >= 0, 1.0, -1.0)
+        # Preserve input dtype (1.0/-1.0 scalars would upcast bf16 to float32)
+        pos = x.new_ones(())
+        return torch.where(x >= 0, pos, -pos)
 
     @staticmethod
     def backward(ctx, grad_output):
