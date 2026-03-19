@@ -24,6 +24,13 @@ try:
 except ImportError:
     HAS_FLA = False
 
+# Optional: Liger Kernel fused SiLU*Mul (saves one full activation read+write)
+try:
+    from liger_kernel.ops.swiglu import LigerSiLUMulFunction
+    HAS_LIGER = True
+except ImportError:
+    HAS_LIGER = False
+
 
 # ---------------------------------------------------------------------------
 # Primitives
@@ -203,6 +210,9 @@ class SwiGLUFFN(nn.Module):
 
     def forward(self, x):
         gate, up = self.gate_up(x).chunk(2, dim=-1)
+        if HAS_LIGER:
+            # Fused SiLU * Mul: single kernel, ~1.5x less memory on FFN
+            return self.w2(LigerSiLUMulFunction.apply(gate, up))
         return self.w2(F.silu(gate) * up)
 
 

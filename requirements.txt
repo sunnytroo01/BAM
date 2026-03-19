@@ -8,6 +8,6 @@ numpy>=1.24.0
 datasets>=2.14.0
 huggingface_hub>=0.17.0
 
-# Optional: Flash Linear Attention fused Triton kernel (significant speedup)
-# pip install flash-linear-attention
-# Requires: triton>=2.2.0
+# Optional: fused Triton kernels (auto-detected, significant speedup)
+# pip install flash-linear-attention  # fused chunked association kernel
+# pip install liger-kernel            # fused SiLU*Mul, RMSNorm, etc.
