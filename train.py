@@ -313,7 +313,7 @@ def train(args):
 
         # ---- Eval ----
         if global_step % config.eval_interval == 0:
-            eval_loss, eval_bpb = evaluate(
+            eval_loss, eval_bpb, val_iter = evaluate(
                 model_engine, model, val_iter, val_loader, config
             )
             log(f"  [EVAL] step {global_step} | loss {eval_loss:.4f} | bpb {eval_bpb:.3f}")
@@ -344,8 +344,8 @@ def train(args):
 # ---------------------------------------------------------------------------
 
 @torch.no_grad()
-def evaluate(engine, model, val_iter, val_loader, config) -> tuple:
-    """Eval with bf16 autocast and persistent iterator."""
+def evaluate(engine, model, val_iter, val_loader, config):
+    """Eval with bf16 autocast. Returns (loss, bpb, updated_val_iter)."""
     model.eval()
     total_loss = 0.0
     n = 0
@@ -365,7 +365,8 @@ def evaluate(engine, model, val_iter, val_loader, config) -> tuple:
 
     model.train()
     avg_loss = total_loss / max(n, 1)
-    return avg_loss, avg_loss * _BPB_SCALE
+    # FIX: return val_iter so caller gets the updated iterator
+    return avg_loss, avg_loss * _BPB_SCALE, val_iter
 
 
 # ---------------------------------------------------------------------------

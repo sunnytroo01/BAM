@@ -173,10 +173,12 @@ def check_model_smoke(config):
     header("3/7  Model Smoke Test (forward + backward)")
 
     import torch
+    import math
     from btn.config import BTNConfig
-    from btn.model import BinaryThinkingNet, bytes_to_bits
+    from btn.model import BinaryThinkingNet
 
-    # Use debug config for actual forward/backward (even if validating 175B config)
+    BPB_SCALE = 8.0 / math.log(2)
+
     smoke_config = BTNConfig.btn_debug()
     info(f"Running smoke test with debug config ({smoke_config.estimated_params / 1e6:.1f}M params)")
 
@@ -188,18 +190,17 @@ def check_model_smoke(config):
         return False
 
     try:
-        # Forward pass
         batch = torch.randint(0, 256, (2, smoke_config.context_length + 1), dtype=torch.long)
         t0 = time.time()
-        loss, metrics = model.compute_loss(batch, use_checkpoint=True)
+        loss = model.compute_loss(batch, use_checkpoint=True)
         t_fwd = time.time() - t0
-        ok(f"Forward pass: loss={loss.item():.4f}, BPB={metrics['bpb']:.2f} ({t_fwd:.2f}s)")
+        bpb = loss.item() * BPB_SCALE
+        ok(f"Forward pass: loss={loss.item():.4f}, BPB={bpb:.2f} ({t_fwd:.2f}s)")
     except Exception as e:
         fail("Forward pass failed", traceback.format_exc())
         return False
 
     try:
-        # Backward pass
         t0 = time.time()
         loss.backward()
         t_bwd = time.time() - t0
@@ -208,7 +209,6 @@ def check_model_smoke(config):
         fail("Backward pass failed", traceback.format_exc())
         return False
 
-    # Check gradients exist
     has_grads = all(
         p.grad is not None for p in model.parameters() if p.requires_grad
     )
@@ -220,21 +220,20 @@ def check_model_smoke(config):
         )
         warn(f"{n_no_grad} parameters missing gradients")
 
-    # Check bytes_to_bits round-trip
-    test_bytes = torch.tensor([[65, 66, 0, 255]], dtype=torch.long)  # A, B, NUL, 0xFF
-    bits = bytes_to_bits(test_bytes)
-    from btn.model import bits_to_bytes
-    recovered = bits_to_bytes(bits)
+    # LUT round-trip test
+    test_bytes = torch.tensor([[65, 66, 0, 255]], dtype=torch.long)
+    bits = model.bits_lut[test_bytes]
+    powers = torch.tensor([128, 64, 32, 16, 8, 4, 2, 1], dtype=torch.long)
+    recovered = (bits.long() * powers).sum(-1)
     if torch.equal(test_bytes, recovered):
-        ok("Byte↔Bit conversion round-trip verified")
+        ok("LUT byte/bit round-trip verified")
     else:
-        fail("Byte↔Bit conversion mismatch", f"Input: {test_bytes}\nRecovered: {recovered}")
+        fail("LUT byte/bit mismatch", f"Input: {test_bytes}\nRecovered: {recovered}")
         return False
 
-    # Test generation (recurrent inference mode)
     try:
         model.eval()
-        prompt = torch.tensor([[72, 101, 108, 108, 111]], dtype=torch.long)  # "Hello"
+        prompt = torch.tensor([[72, 101, 108, 108, 111]], dtype=torch.long)
         with torch.no_grad():
             out = model.generate(prompt, max_new_bytes=10, temperature=1.0)
         ok(f"Generation works: produced {out.shape[1]} bytes from 5-byte prompt")
@@ -421,7 +420,7 @@ def check_vram_estimation(config, n_gpus=None):
     days_to_train = config.total_steps / steps_per_day if steps_per_day > 0 else float("inf")
 
     print()
-    info(f"Estimated throughput: ~{steps_per_step:.1f}s/step, ~{steps_per_day:.0f} steps/day")
+    info(f"Estimated throughput: ~{secs_per_step:.1f}s/step, ~{steps_per_day:.0f} steps/day")
     info(f"Estimated training time: ~{days_to_train:.1f} days for {config.total_steps:,} steps")
 
     return True
