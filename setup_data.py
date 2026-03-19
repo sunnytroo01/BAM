@@ -3,21 +3,19 @@
 Download and prepare training data for BTN.
 
 Run this on a CHEAP GPU pod with your network volume attached.
-The data gets saved to network storage so your expensive B200 pod
-can read it instantly without re-downloading.
 
 Usage:
-    # Default: download FineWeb-Edu (~50GB sample) to network storage
-    python setup_data.py
+    # 4TB diverse mix (recommended for 200B model)
+    python setup_data.py --dataset 4tb-mix
 
-    # Custom dataset and size
-    python setup_data.py --dataset HuggingFaceFW/fineweb-edu --size 100GB
+    # Single source
+    python setup_data.py --dataset fineweb-edu --size 100GB
+
+    # Wikipedia only
+    python setup_data.py --dataset wikipedia --size 22GB
 
     # Use your own text files
     python setup_data.py --local_dir /path/to/my/text/files
-
-    # Custom output path
-    python setup_data.py --output /workspace/data/btn
 """
 
 import argparse
@@ -31,115 +29,187 @@ import numpy as np
 
 
 # ---------------------------------------------------------------------------
-# Download from HuggingFace
+# Dataset registry
 # ---------------------------------------------------------------------------
 
-def download_hf_dataset(
+DATASETS = {
+    "fineweb-edu": "HuggingFaceFW/fineweb-edu",
+    "fineweb": "HuggingFaceFW/fineweb",
+    "slimpajama": "cerebras/SlimPajama-627B",
+    "c4": "allenai/c4",
+    "openwebtext": "Skylion007/openwebtext",
+    "redpajama": "togethercomputer/RedPajama-Data-1T-Sample",
+    "wikipedia": "legacy-datasets/wikipedia",
+}
+
+DATASET_CONFIGS = {
+    "legacy-datasets/wikipedia": "20220301.en",
+    "wikimedia/wikipedia": "20231101.en",
+    "allenai/c4": "en",
+}
+
+# 4TB diverse mix: high-quality web + diverse sources + reference
+# Optimized for training 200B parameter models
+DATA_MIX_4TB = [
+    ("HuggingFaceFW/fineweb-edu", 2500),  # 2.5TB high-quality educational web
+    ("cerebras/SlimPajama-627B",   900),  # 900GB diverse (CC, C4, GitHub, Books, ArXiv, Wiki)
+    ("allenai/c4",                 300),  # 300GB cleaned Common Crawl
+    ("Skylion007/openwebtext",      24),  # 24GB GPT-2 quality web
+    ("legacy-datasets/wikipedia",   22),  # 22GB encyclopedia (high signal)
+]
+# Total: ~3,746GB ≈ 3.75TB (rounds to ~4TB with encoding overhead)
+
+
+# ---------------------------------------------------------------------------
+# Core download function
+# ---------------------------------------------------------------------------
+
+def stream_dataset_to_file(
     dataset_name: str,
-    output_dir: str,
-    size_gb: float = 50.0,
-    split: str = "train",
+    file_handle,
+    target_bytes: int,
+    start_bytes: int = 0,
 ):
-    """Stream a HuggingFace dataset and save raw bytes to a memmap file."""
+    """Stream a HuggingFace dataset and write raw bytes to an open file."""
     from datasets import load_dataset
 
-    output_path = Path(output_dir)
-    output_path.mkdir(parents=True, exist_ok=True)
-    memmap_path = output_path / "bytes.bin"
-    meta_path = output_path / "meta.txt"
-
-    if memmap_path.exists():
-        with open(meta_path) as f:
-            existing_size = int(f.read().strip())
-        print(f"Data already exists: {existing_size:,} bytes ({existing_size / 1e9:.2f} GB)")
-        print(f"Delete {memmap_path} to re-download.")
-        return
-
-    target_bytes = int(size_gb * 1e9)
-    print(f"Downloading {dataset_name} (target: {size_gb:.0f} GB)...")
-    print(f"Streaming to {memmap_path}")
-    print()
-
-    # Stream dataset — never loads everything into RAM
-    # Some datasets (e.g., Wikipedia) need a config name
     ds_config = DATASET_CONFIGS.get(dataset_name)
     if ds_config:
-        print(f"Using config: {ds_config}")
-        ds = load_dataset(dataset_name, ds_config, split=split, streaming=True)
+        ds = load_dataset(dataset_name, ds_config, split="train", streaming=True)
     else:
-        ds = load_dataset(dataset_name, split=split, streaming=True)
+        ds = load_dataset(dataset_name, split="train", streaming=True)
 
-    # Figure out the text column name
-    text_col = None
+    # Detect text column
     sample = next(iter(ds))
+    text_col = None
     for col in ["text", "content", "document", "passage"]:
         if col in sample:
             text_col = col
             break
-
     if text_col is None:
         for key, val in sample.items():
             if isinstance(val, str) and len(val) > 50:
                 text_col = key
                 break
-
     if text_col is None:
-        print(f"ERROR: Could not find text column in dataset. Columns: {list(sample.keys())}")
-        sys.exit(1)
+        print(f"  WARNING: No text column found in {dataset_name}, skipping")
+        return 0
 
-    print(f"Using text column: '{text_col}'")
-
-    # Write to a temporary file, then rename
-    tmp_path = output_path / "bytes.bin.tmp"
-    total_bytes = 0
+    written = 0
     t_start = time.time()
     t_last = t_start
 
+    for example in ds:
+        text = example[text_col]
+        if not text:
+            continue
+        raw = text.encode("utf-8")
+        file_handle.write(raw)
+        written += len(raw)
+
+        now = time.time()
+        if now - t_last > 10.0:
+            total = start_bytes + written
+            speed = written / (now - t_start) / 1e6
+            print(
+                f"    {dataset_name}: {written / 1e9:.1f}/{target_bytes / 1e9:.0f} GB "
+                f"(total: {total / 1e9:.1f} GB) | {speed:.0f} MB/s",
+                flush=True,
+            )
+            t_last = now
+
+        if written >= target_bytes:
+            break
+
+    return written
+
+
+def download_single(dataset_name: str, output_dir: str, size_gb: float):
+    """Download a single dataset."""
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    memmap_path = output_path / "bytes.bin"
+    meta_path = output_path / "meta.txt"
+
+    if memmap_path.exists() and meta_path.exists():
+        with open(meta_path) as f:
+            existing = int(f.read().strip())
+        print(f"Data already exists: {existing:,} bytes ({existing / 1e9:.2f} GB)")
+        print(f"Delete {memmap_path} to re-download.")
+        return
+
+    target = int(size_gb * 1e9)
+    print(f"Downloading {dataset_name} ({size_gb:.0f} GB)...")
+
+    tmp_path = output_path / "bytes.bin.tmp"
     with open(tmp_path, "wb") as f:
-        for i, example in enumerate(ds):
-            text = example[text_col]
-            if not text:
-                continue
+        written = stream_dataset_to_file(dataset_name, f, target)
 
-            raw = text.encode("utf-8")
-            f.write(raw)
-            total_bytes += len(raw)
+    _finalize(output_path, tmp_path, written)
 
-            # Progress update every 5 seconds
-            now = time.time()
-            if now - t_last > 5.0:
-                elapsed = now - t_start
-                speed = total_bytes / elapsed / 1e6
-                pct = total_bytes / target_bytes * 100
-                print(
-                    f"  {total_bytes / 1e9:.2f} / {size_gb:.0f} GB "
-                    f"({pct:.1f}%) | {speed:.1f} MB/s | "
-                    f"{elapsed:.0f}s elapsed",
-                    flush=True,
-                )
-                t_last = now
 
-            if total_bytes >= target_bytes:
-                break
+def download_mix(mix: list, output_dir: str):
+    """Download multiple datasets sequentially into one file."""
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    memmap_path = output_path / "bytes.bin"
+    meta_path = output_path / "meta.txt"
 
-    # Finalize
+    if memmap_path.exists() and meta_path.exists():
+        with open(meta_path) as f:
+            existing = int(f.read().strip())
+        print(f"Data already exists: {existing:,} bytes ({existing / 1e9:.2f} GB)")
+        print(f"Delete {memmap_path} to re-download.")
+        return
+
+    total_target = sum(gb for _, gb in mix)
+    print(f"Downloading {len(mix)}-source mix ({total_target:.0f} GB total)...")
+    print()
+    for ds_name, gb in mix:
+        print(f"  {ds_name}: {gb} GB")
+    print()
+
+    tmp_path = output_path / "bytes.bin.tmp"
+    total_written = 0
+    t_start = time.time()
+
+    with open(tmp_path, "wb") as f:
+        for i, (ds_name, gb) in enumerate(mix):
+            target = int(gb * 1e9)
+            print(f"[{i+1}/{len(mix)}] {ds_name} ({gb} GB)...")
+            written = stream_dataset_to_file(ds_name, f, target, start_bytes=total_written)
+            total_written += written
+            elapsed = time.time() - t_start
+            print(
+                f"  Done: {written / 1e9:.1f} GB from {ds_name} "
+                f"(total: {total_written / 1e9:.1f} GB, {elapsed / 3600:.1f}h elapsed)"
+            )
+            print()
+
+    _finalize(output_path, tmp_path, total_written)
+
+
+def _finalize(output_path: Path, tmp_path: Path, total_bytes: int):
+    """Rename tmp file and create cache structure."""
+    memmap_path = output_path / "bytes.bin"
+    meta_path = output_path / "meta.txt"
+
     os.rename(tmp_path, memmap_path)
     with open(meta_path, "w") as f:
         f.write(str(total_bytes))
 
-    # Also create the .cache structure that ByteDataset expects
+    # Create .cache structure that ByteDataset expects
     cache_dir = output_path / ".cache"
     cache_dir.mkdir(exist_ok=True)
-    # Symlink so ByteDataset finds it
     cache_bytes = cache_dir / "bytes.bin"
     cache_meta = cache_dir / "meta.txt"
+    # Copy instead of symlink (more portable, works everywhere)
     if not cache_bytes.exists():
-        os.symlink(memmap_path, cache_bytes)
+        os.link(memmap_path, cache_bytes)  # hardlink = no extra disk space
     if not cache_meta.exists():
-        os.symlink(meta_path, cache_meta)
+        os.link(meta_path, cache_meta)
 
-    elapsed = time.time() - t_start
-    print(f"\nDone! {total_bytes:,} bytes ({total_bytes / 1e9:.2f} GB) in {elapsed / 60:.1f} min")
+    print(f"Done! {total_bytes:,} bytes ({total_bytes / 1e9:.1f} GB)")
     print(f"Saved to: {output_path}")
 
 
@@ -148,10 +218,8 @@ def download_hf_dataset(
 # ---------------------------------------------------------------------------
 
 def process_local_files(local_dir: str, output_dir: str):
-    """Read local text files and convert to byte memmap."""
     output_path = Path(output_dir)
     output_path.mkdir(parents=True, exist_ok=True)
-
     cache_dir = output_path / ".cache"
     cache_dir.mkdir(exist_ok=True)
     memmap_path = cache_dir / "bytes.bin"
@@ -160,14 +228,13 @@ def process_local_files(local_dir: str, output_dir: str):
     if memmap_path.exists():
         with open(meta_path) as f:
             existing = int(f.read().strip())
-        print(f"Cache already exists: {existing:,} bytes. Delete {memmap_path} to rebuild.")
+        print(f"Cache exists: {existing:,} bytes. Delete {memmap_path} to rebuild.")
         return
 
     patterns = ["*.txt", "*.md", "*.json", "*.jsonl", "*.csv", "*.html"]
     files = []
     for p in patterns:
         files.extend(glob.glob(os.path.join(local_dir, "**", p), recursive=True))
-
     if not files:
         print(f"ERROR: No text files found in {local_dir}")
         sys.exit(1)
@@ -187,16 +254,12 @@ def process_local_files(local_dir: str, output_dir: str):
             print(f"  Warning: skipping {f}: {e}")
 
     print(f"Total: {total_bytes:,} bytes ({total_bytes / 1e9:.2f} GB)")
-    print(f"Writing to {memmap_path}...")
-
     data = np.concatenate([np.frombuffer(c, dtype=np.uint8) for c in chunks])
     fp = np.memmap(str(memmap_path), dtype=np.uint8, mode="w+", shape=(total_bytes,))
     fp[:] = data[:]
     fp.flush()
-
     with open(meta_path, "w") as f:
         f.write(str(total_bytes))
-
     print(f"Done! Data ready at {output_path}")
 
 
@@ -204,44 +267,29 @@ def process_local_files(local_dir: str, output_dir: str):
 # Main
 # ---------------------------------------------------------------------------
 
-DATASETS = {
-    "fineweb-edu": "HuggingFaceFW/fineweb-edu",
-    "fineweb": "HuggingFaceFW/fineweb",
-    "c4": "allenai/c4",
-    "pile": "EleutherAI/the_pile",
-    "openwebtext": "Skylion007/openwebtext",
-    "redpajama": "togethercomputer/RedPajama-Data-1T-Sample",
-    "wikipedia": "legacy-datasets/wikipedia",
-}
-
-# Special configs for datasets that need them
-DATASET_CONFIGS = {
-    "legacy-datasets/wikipedia": "20220301.en",
-    "wikimedia/wikipedia": "20231101.en",
-}
-
-
 def main():
     parser = argparse.ArgumentParser(
         description="Download and prepare BTN training data to network storage"
     )
     parser.add_argument(
         "--output", type=str, default="/workspace/data/btn",
-        help="Output directory (should be on RunPod network volume)",
+        help="Output directory (on RunPod network volume)",
     )
     parser.add_argument(
         "--dataset", type=str, default="fineweb-edu",
-        help=f"Dataset name. Shortcuts: {list(DATASETS.keys())}. Or any HuggingFace dataset path.",
+        help=(
+            f"Dataset: {list(DATASETS.keys())} or '4tb-mix' for the full "
+            f"4TB diverse training mix. Or any HuggingFace path."
+        ),
     )
     parser.add_argument(
         "--size", type=str, default="50GB",
-        help="Target download size (e.g., 10GB, 100GB, 1TB)",
+        help="Target download size (e.g., 10GB, 100GB, 1TB). Ignored for 4tb-mix.",
     )
     parser.add_argument(
         "--local_dir", type=str, default=None,
         help="Use local text files instead of downloading",
     )
-
     args = parser.parse_args()
 
     # Parse size
@@ -255,25 +303,32 @@ def main():
     else:
         size_gb = float(size_str)
 
-    print("=" * 50)
+    print("=" * 60)
     print("  BTN Data Setup")
-    print("=" * 50)
+    print("=" * 60)
     print(f"  Output: {args.output}")
     print()
 
     if args.local_dir:
         print(f"  Source: local files from {args.local_dir}")
-        print("=" * 50)
+        print("=" * 60)
         process_local_files(args.local_dir, args.output)
+    elif args.dataset == "4tb-mix":
+        total_gb = sum(gb for _, gb in DATA_MIX_4TB)
+        print(f"  Source: 4TB diverse training mix ({len(DATA_MIX_4TB)} sources)")
+        print(f"  Size:   {total_gb:.0f} GB")
+        print("=" * 60)
+        download_mix(DATA_MIX_4TB, args.output)
     else:
         dataset_path = DATASETS.get(args.dataset, args.dataset)
         print(f"  Source: {dataset_path}")
         print(f"  Size:   {size_gb:.0f} GB")
-        print("=" * 50)
-        download_hf_dataset(dataset_path, args.output, size_gb=size_gb)
+        print("=" * 60)
+        download_single(dataset_path, args.output, size_gb=size_gb)
 
-    print("\nNext step: start training on your B200 pod:")
-    print("  git clone <your-repo> && cd BAM && bash train.sh")
+    print()
+    print("Next step: start training on your B200 pod:")
+    print("  git clone https://github.com/sunnytroo01/BAM.git && cd BAM && bash train.sh")
 
 
 if __name__ == "__main__":
