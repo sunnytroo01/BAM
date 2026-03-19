@@ -365,13 +365,16 @@ class BinaryThinkingNet(nn.Module):
 
         logits, states, _ = self(prompt_bytes, states=None, position_offset=0)
 
+        max_pos = self.config.context_length - 1
         pos = T_prompt
         for _ in range(max_new_bytes):
             bit_logits = logits[:, -1, :] / temperature
             sampled_bits = torch.bernoulli(torch.sigmoid(bit_logits)).long()
             next_byte = (sampled_bits * self.bit_powers).sum(-1, keepdim=True)
             generated[:, pos] = next_byte.squeeze(-1)
-            logits, states, _ = self(next_byte, states=states, position_offset=pos)
+            # Clamp position to avoid index overflow on position_ids buffer
+            safe_pos = min(pos, max_pos)
+            logits, states, _ = self(next_byte, states=states, position_offset=safe_pos)
             pos += 1
 
         return generated[:, :pos]

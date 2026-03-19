@@ -1,7 +1,6 @@
 """BTN model and training configuration."""
 
 from dataclasses import dataclass
-import math
 
 
 @dataclass

@@ -79,10 +79,19 @@ class ByteDataset(Dataset):
         return self.n_samples
 
     def __getitem__(self, idx: int) -> torch.Tensor:
-        offset = self.start + idx * self.seq_len
-        # Return uint8: 8x smaller than int64 for H2D transfer
-        chunk = np.array(self.data[offset : offset + self.seq_len])
-        return torch.from_numpy(chunk)
+        # Random-offset sampling: instead of fixed chunk boundaries,
+        # pick a random start within the range. More data diversity per epoch,
+        # no wasted compute on the same fixed splits.
+        max_start = self.end - self.seq_len
+        if self.start < max_start:
+            # Use idx as seed-offset for reproducibility within epoch
+            offset = self.start + (idx * 104729) % (max_start - self.start)
+        else:
+            offset = self.start
+        chunk = self.data[offset : offset + self.seq_len]
+        if not chunk.flags['C_CONTIGUOUS']:
+            chunk = np.ascontiguousarray(chunk)
+        return torch.from_numpy(chunk.copy())
 
     @staticmethod
     def _read_all_files(data_dir: str) -> np.ndarray:

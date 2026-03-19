@@ -47,7 +47,9 @@ def get_lr(step: int, config: BTNConfig) -> float:
     - Decay: linear decay to min_lr over final 20%
     """
     if step < config.warmup_steps:
-        return config.learning_rate * step / max(config.warmup_steps, 1)
+        # Start from 1e-7 instead of 0 (strictly better — avoids wasted first step)
+        min_warmup_lr = 1e-7
+        return min_warmup_lr + (config.learning_rate - min_warmup_lr) * step / max(config.warmup_steps, 1)
     stable_end = int(config.total_steps * 0.80)
     if step < stable_end:
         return config.learning_rate
